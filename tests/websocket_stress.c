@@ -157,20 +157,18 @@ static void nn_ws_kill_autobahn (NN_UNUSED void)
     nn_assert (rc == 0);
 }
 
-static void nn_ws_autobahn_test (int socket, void *recv_buf, int test_id)
+static void nn_ws_autobahn_test (int socket, int test_id)
 {
-    int performing_test;
     int rc;
     uint8_t ws_msg_type;
-
-    performing_test = 1;
+    void *recv_buf;
 
     /*  Perform test until remote endpoint either initiates a Close
         Handshake, or if this endpoint fails the connection based on
         invalid input from the remote peer. */
-    while (performing_test) {
+    while (1) {
 
-        rc = nn_ws_recv (socket, recv_buf, NN_MSG, &ws_msg_type, 0);
+        rc = nn_ws_recv (socket, &recv_buf, NN_MSG, &ws_msg_type, 0);
         errno_assert (rc >= 0);
 
         printf ("Test %03d: Rx: 0x%02x (%d bytes)\n", test_id, ws_msg_type, rc);
@@ -178,15 +176,15 @@ static void nn_ws_autobahn_test (int socket, void *recv_buf, int test_id)
         switch (ws_msg_type) {
         case NN_WS_MSG_TYPE_TEXT:
             /*  Echo text message verbatim. */
-            rc = nn_ws_send (socket, recv_buf, NN_MSG, ws_msg_type, 0);
+            rc = nn_ws_send (socket, &recv_buf, NN_MSG, ws_msg_type, 0);
             break;
         case NN_WS_MSG_TYPE_BINARY:
             /*  Echo binary message verbatim. */
-            rc = nn_ws_send (socket, recv_buf, NN_MSG, ws_msg_type, 0);
+            rc = nn_ws_send (socket, &recv_buf, NN_MSG, ws_msg_type, 0);
             break;
         case NN_WS_MSG_TYPE_PING:
             /*  As per RFC 6455 5.5.3, echo PING data payload as a PONG. */
-            rc = nn_ws_send (socket, recv_buf, NN_MSG,
+            rc = nn_ws_send (socket, &recv_buf, NN_MSG,
                 NN_WS_MSG_TYPE_PONG, 0);
             break;
         case NN_WS_MSG_TYPE_PONG:
@@ -194,16 +192,14 @@ static void nn_ws_autobahn_test (int socket, void *recv_buf, int test_id)
             break;
         case NN_WS_MSG_TYPE_CLOSE:
             /*  As per RFC 6455 5.5.1, repeat Close Code in message body. */
-            rc = nn_ws_send (socket, recv_buf, NN_MSG, ws_msg_type, 0);
-            performing_test = 0;
-            break;
+            rc = nn_ws_send (socket, &recv_buf, NN_MSG, ws_msg_type, 0);
+            return;
         case NN_WS_MSG_TYPE_GONE:
             /*  This indicates the remote peer has sent invalid data forcing
                 the local endpoint to fail the connection as per RFC 6455. */
-            performing_test = 0;
             printf ("Test %03d: correctly prevented remote endpoint fuzz\n",
                 test_id);
-            break;
+            return;
         default:
             /*  The library delivered an unexpected message type. */
             nn_assert (0);
@@ -260,7 +256,7 @@ int main ()
         521+ test cases. 1 digit is allowed, to allow development of
         specific cases, and up to 4 digits, for potential future expansion
         of the test suite. */
-    nn_assert (1 <= rc && rc <= 4);
+    errno_assert (1 <= rc && rc <= 4);
 
     nn_assert (ws_msg_type == NN_WS_MSG_TYPE_TEXT);
 
@@ -302,7 +298,7 @@ int main ()
         local_connected_ep = test_connect (autobahn_client, autobahn_addr);
         errno_assert (local_connected_ep >= 0);
 
-        nn_ws_autobahn_test (autobahn_client, &recv_buf, i);
+        nn_ws_autobahn_test (autobahn_client, i);
 
         rc = nn_shutdown (autobahn_client, local_connected_ep);
         errno_assert (rc == 0);
@@ -354,7 +350,7 @@ int main ()
 
     /*  The same number of cases are tested for servers as for clients. */
     for (i = 1; i <= cases; i++) {
-        nn_ws_autobahn_test (autobahn_server, &recv_buf, i);
+        nn_ws_autobahn_test (autobahn_server, i);
     }
 
     /*  TODO: This hangs; why? It must be fixed. */

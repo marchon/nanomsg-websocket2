@@ -22,10 +22,13 @@
 */
 
 #include "ws_handshake.h"
+#include "sha1.h"
 
 #include "../../aio/timer.h"
 
 #include "../../core/sock.h"
+
+#include "../utils/base64.h"
 
 #include "../../utils/alloc.h"
 #include "../../utils/err.h"
@@ -37,6 +40,7 @@
 
 #include <stddef.h>
 #include <string.h>
+#include <ctype.h>
 
 /*****************************************************************************/
 /***  BEGIN undesirable dependency *******************************************/
@@ -110,43 +114,6 @@ const size_t NN_WS_HANDSHAKE_SP_MAP_LEN = sizeof (NN_WS_HANDSHAKE_SP_MAP) /
 #define NN_WS_HANDSHAKE_RESPONSE_NOTPEER 6
 #define NN_WS_HANDSHAKE_RESPONSE_UNKNOWNTYPE 7
 
-/*****************************************************************************/
-/*  SHA-1 SECURITY NOTICE:                                                   */
-/*  The algorithm as designed below is not intended for general purpose use. */
-/*  As-designed, it is a single-purpose function for this WebSocket          */
-/*  Opening Handshake. As per RFC 6455 10.8, SHA-1 usage "doesn't depend on  */
-/*  any security properties of SHA-1, such as collision resistance or        */
-/*  resistance to the second pre-image attack (as described in [RFC4270])".  */
-/*  Caveat emptor for uses of this function elsewhere.                       */
-/*                                                                           */
-/*  Based on sha1.c (Public Domain) by Steve Reid, these functions calculate */
-/*  the SHA1 hash of arbitrary byte locations byte-by-byte.                  */
-/*****************************************************************************/
-#define SHA1_HASH_LEN 20
-#define SHA1_BLOCK_LEN 64
-#define sha1_rol32(num,bits) ((num << bits) | (num >> (32 - bits)))
-
-typedef struct sha1hash {
-    uint32_t buffer [SHA1_BLOCK_LEN / sizeof (uint32_t)];
-    uint32_t state [SHA1_HASH_LEN / sizeof (uint32_t)];
-    uint32_t bytes_hashed;
-    uint8_t buffer_offset;
-    uint8_t is_little_endian;
-};
-
-static void sha1_init (struct sha1hash *s);
-static void sha1_hashbyte (struct sha1hash *s, uint8_t data);
-static uint8_t* sha1_result (struct sha1hash *s);
-
-/*  Based on base64.c (Public Domain) by Jon Mayo, this function encodes an
-    arbitrary octect array into a base64 null-terminated string into supplied
-    buffer as per RFC 2045 MIME. */
-static int base64_encode (const uint8_t *in, size_t in_len, char *out, size_t out_len);
-
-/* Based on base64.c (Public Domain) by Jon Mayo, this function decodes
-   a base64 string into supplied buffer as per RFC 2045 MIME. */
-static int base64_decode (const char *in, size_t in_len, uint8_t *out, size_t out_len);
-
 /*  Private functions. */
 static void nn_ws_handshake_handler (struct nn_fsm *self, int src, int type,
     void *srcptr);
@@ -159,7 +126,7 @@ static int nn_ws_handshake_parse_client_opening (struct nn_ws_handshake *self);
 static void nn_ws_handshake_server_reply (struct nn_ws_handshake *self);
 static void nn_ws_handshake_client_request (struct nn_ws_handshake *self);
 static int nn_ws_handshake_parse_server_response (struct nn_ws_handshake *self);
-static int nn_ws_handshake_hash_key (uint8_t *key, size_t key_len,
+static int nn_ws_handshake_hash_key (const uint8_t *key, size_t key_len,
     uint8_t *hashed, size_t hashed_len);
 
 /*  String parsing support functions. */
@@ -365,7 +332,7 @@ static int nn_ws_match_value (const char* termseq, const char **subj,
     else {
         return NN_WS_HANDSHAKE_NOMATCH;
     }
-        
+
     if (ignore_leading_sp) {
         while (*start == '\x20' && start < end) {
             start++;
@@ -373,7 +340,7 @@ static int nn_ws_match_value (const char* termseq, const char **subj,
     }
 
     if (addr)
-        *addr = start;
+        *addr = (const uint8_t *) start;
 
     /*  In this special case, the value was "found", but is just empty or
         ignored space. */
@@ -423,7 +390,7 @@ static void nn_ws_handshake_handler (struct nn_fsm *self, int src, int type,
 {
     struct nn_ws_handshake *handshaker;
 
-    unsigned i;
+    signed i;
 
     handshaker = nn_cont (self, struct nn_ws_handshake, fsm);
 
@@ -457,7 +424,7 @@ static void nn_ws_handshake_handler (struct nn_fsm *self, int src, int type,
                         sizeof (handshaker->opening_hs));
                     handshaker->state = NN_WS_HANDSHAKE_STATE_SERVER_RECV;
                     nn_usock_recv (handshaker->usock, handshaker->opening_hs,
-                        handshaker->recv_len);
+                        handshaker->recv_len, NULL);
                     return;
                 default:
                     /*  Unexpected mode. */
@@ -541,7 +508,7 @@ static void nn_ws_handshake_handler (struct nn_fsm *self, int src, int type,
                         handshaker->retries++;
                         nn_usock_recv (handshaker->usock,
                             handshaker->opening_hs + handshaker->recv_pos,
-                            handshaker->recv_len);
+                            handshaker->recv_len, NULL);
                     }
                     return;
                 default:
@@ -623,7 +590,7 @@ static void nn_ws_handshake_handler (struct nn_fsm *self, int src, int type,
             case NN_USOCK_SENT:
                 handshaker->state = NN_WS_HANDSHAKE_STATE_CLIENT_RECV;
                 nn_usock_recv (handshaker->usock, handshaker->response,
-                    handshaker->recv_len);
+                    handshaker->recv_len, NULL);
                 return;
             case NN_USOCK_SHUTDOWN:
                 /*  Ignore it and wait for ERROR event. */
@@ -717,7 +684,7 @@ static void nn_ws_handshake_handler (struct nn_fsm *self, int src, int type,
                         handshaker->retries++;
                         nn_usock_recv (handshaker->usock,
                             handshaker->response + handshaker->recv_pos,
-                            handshaker->recv_len);
+                            handshaker->recv_len, NULL);
                     }
                     return;
                 default:
@@ -878,7 +845,7 @@ static int nn_ws_handshake_parse_client_opening (struct nn_ws_handshake *self)
         headers. */
 
     int rc;
-    char *pos;
+    const char *pos;
     unsigned i;
 
     /*  Guarantee that a NULL terminator exists to enable treating this
@@ -887,9 +854,9 @@ static int nn_ws_handshake_parse_client_opening (struct nn_ws_handshake *self)
 
     /*  Having found the NULL terminator, from this point forward string
         functions may be used. */
-    nn_assert (strlen (self->opening_hs) < sizeof (self->opening_hs));
+    nn_assert (strlen ((const char *) self->opening_hs) < sizeof (self->opening_hs));
 
-    pos = self->opening_hs;
+    pos = (const char *) self->opening_hs;
 
     /*  Is the opening handshake from the client fully received? */
     if (!strstr (pos, NN_WS_HANDSHAKE_TERMSEQ))
@@ -1080,7 +1047,7 @@ static int nn_ws_handshake_parse_server_response (struct nn_ws_handshake *self)
         headers. */
 
     int rc;
-    char *pos;
+    const char *pos;
 
     /*  Guarantee that a NULL terminator exists to enable treating this
         recv buffer like a string. The lack of such would indicate a failure
@@ -1089,9 +1056,9 @@ static int nn_ws_handshake_parse_server_response (struct nn_ws_handshake *self)
 
     /*  Having found the NULL terminator, from this point forward string
         functions may be used. */
-    nn_assert (strlen (self->response) < sizeof (self->response));
+    nn_assert (strlen ((const char *) self->response) < sizeof (self->response));
 
-    pos = self->response;
+    pos = (const char *) self->response;
 
     /*  Is the response from the server fully received? */
     if (!strstr (pos, NN_WS_HANDSHAKE_TERMSEQ))
@@ -1239,7 +1206,7 @@ static void nn_ws_handshake_client_request (struct nn_ws_handshake *self)
 
     nn_random_generate (rand_key, sizeof (rand_key));
 
-    rc = base64_encode (rand_key, sizeof (rand_key),
+    rc = nn_base64_encode (rand_key, sizeof (rand_key),
         encoded_key, sizeof (encoded_key));
 
     encoded_key_len = strlen (encoded_key);
@@ -1248,8 +1215,8 @@ static void nn_ws_handshake_client_request (struct nn_ws_handshake *self)
 
     /*  Pre-calculated expected Accept Key value as per
         RFC 6455 section 4.2.2.5.4 (version December 2011). */
-    rc = nn_ws_handshake_hash_key (encoded_key, encoded_key_len,
-        self->expected_accept_key, sizeof (self->expected_accept_key));
+    rc = nn_ws_handshake_hash_key ((uint8_t *) encoded_key, encoded_key_len,
+        (uint8_t *) self->expected_accept_key, sizeof (self->expected_accept_key));
 
     nn_assert (rc == NN_WS_HANDSHAKE_ACCEPT_KEY_LEN);
 
@@ -1264,7 +1231,7 @@ static void nn_ws_handshake_client_request (struct nn_ws_handshake *self)
     /*  Guarantee that the socket type was found in the map. */
     nn_assert (i < NN_WS_HANDSHAKE_SP_MAP_LEN);
 
-    sprintf (self->opening_hs,
+    sprintf ((char *) self->opening_hs,
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "Upgrade: websocket\r\n"
@@ -1275,7 +1242,7 @@ static void nn_ws_handshake_client_request (struct nn_ws_handshake *self)
         self->resource, self->remote_host, encoded_key,
         NN_WS_HANDSHAKE_SP_MAP[i].ws_sp);
 
-    open_request.iov_len = strlen (self->opening_hs);
+    open_request.iov_len = strlen ((char *) self->opening_hs);
     open_request.iov_base = self->opening_hs;
 
     nn_usock_send (self->usock, &open_request, 1);
@@ -1296,18 +1263,18 @@ static void nn_ws_handshake_server_reply (struct nn_ws_handshake *self)
 
     if (self->response_code == NN_WS_HANDSHAKE_RESPONSE_OK) {
         /*  Upgrade connection as per RFC 6455 section 4.2.2. */
-        
+
         rc = nn_ws_handshake_hash_key (self->key, self->key_len,
-            accept_key, sizeof (accept_key));
+            (uint8_t *) accept_key, sizeof (accept_key));
 
         nn_assert (strlen (accept_key) == NN_WS_HANDSHAKE_ACCEPT_KEY_LEN);
 
         protocol = nn_alloc (self->protocol_len + 1, "WebSocket protocol");
         alloc_assert (protocol);
-        strncpy (protocol, self->protocol, self->protocol_len);
+        strncpy (protocol, (char *)  self->protocol, self->protocol_len);
         protocol [self->protocol_len] = '\0';
 
-        sprintf (self->response,
+        sprintf ((char *) self->response,
             "HTTP/1.1 101 Switching Protocols\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
@@ -1346,11 +1313,11 @@ static void nn_ws_handshake_server_reply (struct nn_ws_handshake *self)
 
         version = nn_alloc (self->version_len + 1, "WebSocket version");
         alloc_assert (version);
-        strncpy (version, self->version, self->version_len);
+        strncpy (version, (char *) self->version, self->version_len);
         version [self->version_len] = '\0';
 
         /*  Fail connection as per RFC 6455 4.4. */
-        sprintf (self->response,
+        sprintf ((char *) self->response,
             "HTTP/1.1 %s\r\n"
             "Sec-WebSocket-Version: %s\r\n",
             code, version);
@@ -1358,7 +1325,7 @@ static void nn_ws_handshake_server_reply (struct nn_ws_handshake *self)
         nn_free (version);
     }
 
-    response.iov_len = strlen (self->response);
+    response.iov_len = strlen ( (const char *) self->response);
     response.iov_base = &self->response;
 
     nn_usock_send (self->usock, &response, 1);
@@ -1366,263 +1333,23 @@ static void nn_ws_handshake_server_reply (struct nn_ws_handshake *self)
     return;
 }
 
-static int nn_ws_handshake_hash_key (uint8_t *key, size_t key_len,
+static int nn_ws_handshake_hash_key (const uint8_t *key, size_t key_len,
     uint8_t *hashed, size_t hashed_len)
 {
     int rc;
     unsigned i;
-    struct sha1hash hash;
+    struct nn_sha1 hash;
 
-    sha1_init (&hash);
+    nn_sha1_init (&hash);
 
     for (i = 0; i < key_len; i++)
-        sha1_hashbyte (&hash, key [i]);
+        nn_sha1_hashbyte (&hash, key [i]);
 
     for (i = 0; i < strlen (NN_WS_HANDSHAKE_MAGIC_GUID); i++)
-        sha1_hashbyte (&hash, NN_WS_HANDSHAKE_MAGIC_GUID [i]);
+        nn_sha1_hashbyte (&hash, NN_WS_HANDSHAKE_MAGIC_GUID [i]);
 
-    rc = base64_encode (sha1_result (&hash),
-        sizeof (hash.state), hashed, hashed_len);
+    rc = nn_base64_encode (nn_sha1_result (&hash),
+        sizeof (hash.state), (char *) hashed, hashed_len);
 
     return rc;
-}
-
-static void sha1_init (struct sha1hash *s)
-{
-    /*  Detect endianness. */
-    union {
-        uint32_t i;
-        char c[4];
-    } test = { 0x00000001 };
-
-    s->is_little_endian = test.c[0];
-
-    /*  Initial state of the hash. */
-    s->state [0] = 0x67452301;
-    s->state [1] = 0xefcdab89;
-    s->state [2] = 0x98badcfe;
-    s->state [3] = 0x10325476;
-    s->state [4] = 0xc3d2e1f0;
-    s->bytes_hashed = 0;
-    s->buffer_offset = 0;
-}
-
-static void sha1_add (struct sha1hash *s, uint8_t data)
-{
-    uint8_t i;
-    uint32_t a, b, c, d, e, t;
-    uint8_t * const buf = (uint8_t*) s->buffer;
-    if (s->is_little_endian)
-        buf [s->buffer_offset ^ 3] = data;
-    else
-        buf [s->buffer_offset] = data;
-
-    s->buffer_offset++;
-    if (s->buffer_offset == SHA1_BLOCK_LEN) {
-        a = s->state [0];
-        b = s->state [1];
-        c = s->state [2];
-        d = s->state [3];
-        e = s->state [4];
-        for (i = 0; i < 80; i++) {
-            if (i >= 16) {
-                t = s->buffer [(i + 13) & 15] ^
-                    s->buffer [(i + 8) & 15] ^
-                    s->buffer [(i + 2) & 15] ^
-                    s->buffer [i & 15];
-                s->buffer [i & 15] = sha1_rol32 (t, 1);
-            }
-
-            if (i < 20)
-                t = (d ^ (b & (c ^ d))) + 0x5A827999;
-            else if (i < 40)
-                t = (b ^ c ^ d) + 0x6ED9EBA1;
-            else if (i < 60)
-                t = ((b & c) | (d & (b | c))) + 0x8F1BBCDC;
-            else
-                t = (b ^ c ^ d) + 0xCA62C1D6;
-
-            t += sha1_rol32 (a, 5) + e + s->buffer [i & 15];
-            e = d;
-            d = c;
-            c = sha1_rol32 (b, 30);
-            b = a;
-            a = t;
-        }
-
-        s->state [0] += a;
-        s->state [1] += b;
-        s->state [2] += c;
-        s->state [3] += d;
-        s->state [4] += e;
-
-        s->buffer_offset = 0;
-    }
-}
-
-static void sha1_hashbyte (struct sha1hash *s, uint8_t data)
-{
-    ++s->bytes_hashed;
-    sha1_add (s, data);
-}
-
-static uint8_t* sha1_result (struct sha1hash *s)
-{
-    int i;
-
-    /*  Pad to complete the last block. */
-    sha1_add (s, 0x80);
-
-    while (s->buffer_offset != 56)
-        sha1_add (s, 0x00);
-
-    /*  Append length in the last 8 bytes. SHA-1 supports 64-bit hashes, so
-        zero-pad the top bits. Shifting to multiply by 8 as SHA-1 supports
-        bit- as well as byte-streams. */
-    sha1_add (s, 0);
-    sha1_add (s, 0);
-    sha1_add (s, 0);
-    sha1_add (s, s->bytes_hashed >> 29);
-    sha1_add (s, s->bytes_hashed >> 21);
-    sha1_add (s, s->bytes_hashed >> 13);
-    sha1_add (s, s->bytes_hashed >> 5);
-    sha1_add (s, s->bytes_hashed << 3);
-
-    /*  Correct byte order for little-endian systems. */
-    if (s->is_little_endian) {
-        for (i = 0; i < 5; i++) {
-            s->state [i] =
-                (((s->state [i]) << 24) & 0xFF000000) |
-                (((s->state [i]) << 8) & 0x00FF0000) |
-                (((s->state [i]) >> 8) & 0x0000FF00) |
-                (((s->state [i]) >> 24) & 0x000000FF);
-        }
-    }
-
-    /* 20-octet pointer to hash. */
-    return (uint8_t*) s->state;
-}
-
-int base64_decode (const char *in, size_t in_len, uint8_t *out, size_t out_len)
-{
-    unsigned ii;
-    unsigned io;
-    unsigned rem;
-    uint32_t v;
-    uint8_t ch;
-
-    /*  Unrolled lookup of ASCII code points.
-        0xFF represents a non-base64 valid character. */
-    const uint8_t DECODEMAP [256] = {
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0x3E, 0xFF, 0xFF, 0xFF, 0x3F,
-        0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B,
-        0x3C, 0x3D, 0xFF, 0xFF, 0xFF, 0x3E, 0xFF, 0xFF,
-        0xFF, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-        0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
-        0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
-        0x17, 0x18, 0x19, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
-        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
-        0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30,
-        0x31, 0x32, 0x33, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-
-    for (io = 0, ii = 0, v = 0, rem = 0; ii < in_len; ii++) {
-        if (isspace (in [ii]))
-            continue;
-        
-        if (in [ii] == '=')
-            break;
-        
-        ch = DECODEMAP [in [ii]];
-        
-        /*  Discard invalid characters as per RFC 2045. */
-        if (ch == 0xFF)
-            break; 
-        
-        v = (v << 6) | ch;
-        rem += 6;
-
-        if (rem >= 8) {
-            rem -= 8;
-            if (io >= out_len)
-                return -ENOBUFS;
-            out [io++] = (v >> rem) & 255;
-        }
-    }
-    if (rem >= 8) {
-        rem -= 8;
-        if (io >= out_len)
-            return -ENOBUFS;
-        out [io++] = (v >> rem) & 255;
-    }
-    return io;
-}
-
-static int base64_encode (const uint8_t *in, size_t in_len, char *out,
-    size_t out_len)
-{
-    unsigned ii;
-    unsigned io;
-    unsigned rem;
-    uint32_t v;
-    uint8_t ch;
-
-    const uint8_t ENCODEMAP [64] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "abcdefghijklmnopqrstuvwxyz"
-        "0123456789+/";
-
-    for (io = 0, ii = 0, v = 0, rem = 0; ii < in_len; ii++) {
-        ch = in [ii];
-        v = (v << 8) | ch;
-        rem += 8;
-        while (rem >= 6) {
-            rem -= 6;
-            if (io >= out_len)
-                return -ENOBUFS;
-            out [io++] = ENCODEMAP [(v >> rem) & 63];
-        }
-    }
-
-    if (rem) {
-        v <<= (6 - rem);
-        if (io >= out_len)
-            return -ENOBUFS;
-        out [io++] = ENCODEMAP [v & 63];
-    }
-
-    /*  Pad to a multiple of 3. */
-    while (io & 3) {
-        if (io >= out_len)
-            return -ENOBUFS;
-        out [io++] = '=';
-    }
-
-    if (io >= out_len)
-        return -ENOBUFS;
-    
-    out [io] = '\0';
-
-    return io;
 }
